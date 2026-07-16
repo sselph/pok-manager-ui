@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  pok-manager:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pok_manager
+    restart: unless-stopped
+    extra_hosts:
+      # Allows the container to communicate with host ports (like game instance RCON ports)
+      - "host.docker.internal:host-gateway"
+    ports:
+      # Web UI access port (Dashboard will be hosted at http://<host-ip>:8084)
+      - "8084:8084"
+    environment:
+      # CRITICAL: The absolute path of the POK-manager directory on the host filesystem.
+      # This is required so that new instance volume mounts map correctly on the host!
+      # Change this to match your actual host directory path (e.g., /home/user/pok).
+      - HOST_BASE_DIR=/path/to/your/POK-manager
+      
+      # Web Dashboard admin password (username is 'admin')
+      - POK_ADMIN_PASSWORD=admin
+      
+      # The user and group IDs under which the game files and containers run (default is 7777:7777)
+      - PUID=7777
+      - PGID=7777
+      
+      # Default settings applied automatically when creating new server instances via the UI
+      - DEFAULT_CLUSTER_ID=cluster
+      - DEFAULT_SERVER_PASSWORD=
+      - DEFAULT_ADMIN_PASSWORD=myadminpassword
+      - DEFAULT_MOD_IDS=
+      - DEFAULT_PASSIVE_MODS=
+      - DEFAULT_CUSTOM_SERVER_ARGS=
+      
+      # Discord Bot Integration (Optional)
+      # 1. Create a Discord App on the developer portal, enable Server Members & Message Content Intents.
+      # 2. Input your bot's token and guild ID below to enable Discord RCON chat relays and slash commands.
+      - DISCORD_TOKEN=
+      - DISCORD_GUILD_ID=
+      # Optional: The global Discord channel ID where manager update notifications should be posted.
+      - DISCORD_CHANNEL_ID=
+      
+      # Optional: Override host IP for RCON connections.
+      # If host.docker.internal fails to resolve inside the container, set this to your host LAN IP (e.g., 192.168.1.10)
+      - RCON_HOST=
+    volumes:
+      # Mount the host Docker daemon socket so the manager can start/stop sibling game containers
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Mount the host manager root directory to /app/workspace inside the container.
+      # This MUST match the directory specified in HOST_BASE_DIR above!
+      - /path/to/your/POK-manager:/app/workspace

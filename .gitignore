@@ -1,0 +1,17 @@
+# Built binaries
+/backend/pok-manager
+
+# Node dependencies and build files
+/frontend/node_modules/
+/frontend/dist/
+/frontend/npm-debug.log*
+
+# Server files, clusters and instances data
+/ServerFiles/
+/Cluster/
+/Instance_*/
+/config/
+
+# OS files
+.DS_Store
+Thumbs.db
