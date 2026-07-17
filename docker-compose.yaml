@@ -2,9 +2,7 @@ version: '3.8'
 
 services:
   pok-manager:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: sselph/pok-manager-ui:main
     container_name: pok_manager
     restart: unless-stopped
     extra_hosts:
