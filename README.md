@@ -2,6 +2,8 @@
 
 A modern, responsive Web Dashboard and Discord Bot companion for managing ARK Survival Ascended dedicated servers, fully layout-compatible with the upstream `POK-manager.sh` directory conventions.
 
+<img width="1864" height="896" alt="image" src="https://github.com/user-attachments/assets/9b22992b-c403-437d-b34c-71b5167f6f5e" />
+
 ---
 
 ## 🚀 Key Features
