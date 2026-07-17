@@ -427,6 +427,7 @@ func runUpdateOrchestration() {
 	log.Printf("[INFO] Running SteamCMD update container with mounts: sharedVolume=%s, logsVolume=%s", sharedVolume, logsVolume)
 	cmdUpdate := exec.Command("docker", "run",
 		"--name", "pok_updater",
+		"--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
 		"--entrypoint", "/opt/steamcmd/steamcmd.sh",
 		"--security-opt", "seccomp=unconfined",
 		"-v", sharedVolume,
