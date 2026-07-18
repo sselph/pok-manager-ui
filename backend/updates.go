@@ -333,10 +333,10 @@ func runUpdateOrchestration() {
 	_ = os.RemoveAll(oldPath)
 
 	if _, err := os.Stat(livePath); err == nil {
-		log.Printf("Cloning live server files to temp folder using cp -al...")
-		cmd := exec.Command("cp", "-al", livePath, tempPath)
+		log.Printf("Cloning live server files to temp folder using cp -a...")
+		cmd := exec.Command("cp", "-a", livePath, tempPath)
 		if output, err := cmd.CombinedOutput(); err != nil {
-			log.Printf("Warning: cp -al failed: %v, output: %s. Falling back to standard copy/mkdir.", err, string(output))
+			log.Printf("Warning: cp -a failed: %v, output: %s. Falling back to standard copy/mkdir.", err, string(output))
 			_ = os.RemoveAll(tempPath)
 			_ = os.MkdirAll(tempPath, 0755)
 		}
@@ -352,19 +352,8 @@ func runUpdateOrchestration() {
 	_ = os.RemoveAll(filepath.Join(tempPath, "steamapps", "downloading"))
 	_ = os.RemoveAll(filepath.Join(tempPath, "steamapps", "temp"))
 
-	// Generate a clean, basic appmanifest file in tempPath/steamapps/
-	// This ensures SteamCMD always recognizes that the app is configured/installed (avoiding "Missing configuration"),
-	// but strips any old manifest IDs or stuck update flags (avoiding "Access Denied" or format assertion crashes).
-	log.Printf("[INFO] Generating clean basic appmanifest file to prevent Missing configuration / Access Denied loops...")
-	_ = os.Remove(filepath.Join(tempPath, "steamapps", "appmanifest_2430930.acf"))
-	_ = os.Remove(filepath.Join(tempPath, "appmanifest_2430930.acf"))
-
-	_ = os.MkdirAll(filepath.Join(tempPath, "steamapps"), 0755)
-	basicManifest := "\"AppState\"\n{\n\t\"appid\"\t\t\"2430930\"\n\t\"Universe\"\t\t\"1\"\n\t\"name\"\t\t\"ARK: Survival Ascended Dedicated Server\"\n\t\"StateFlags\"\t\t\"4\"\n}\n"
-	err = os.WriteFile(filepath.Join(tempPath, "steamapps", "appmanifest_2430930.acf"), []byte(basicManifest), 0644)
-	if err != nil {
-		log.Printf("[WARNING] Failed to write basic appmanifest: %v", err)
-	}
+	// Make sure the steamapps directory exists in tempPath
+	_ = os.MkdirAll(filepath.Join(tempPath, "steamapps"), 0775)
 
 	// Break hard links on all executables and DLLs in the temp directory to prevent Text file busy lockups
 	log.Printf("[INFO] Unlinking executables and DLLs to prevent Text file busy locks...")
@@ -416,7 +405,14 @@ func runUpdateOrchestration() {
 	// Prepare diagnostic logs directory
 	steamLogsPath := filepath.Join(updateBaseDir, "ServerFiles", "steam_logs")
 	_ = os.MkdirAll(steamLogsPath, 0775)
-	_ = exec.Command("chown", "-R", "7777:7777", steamLogsPath).Run()
+
+	// Ensure group-write and setgid permissions so container files are writeable/deleteable by host
+	if out, err := exec.Command("chmod", "-R", "2775", tempPath).CombinedOutput(); err != nil {
+		log.Printf("[WARNING] chmod tempPath failed: %v, output: %s", err, string(out))
+	}
+	if out, err := exec.Command("chmod", "-R", "2775", steamLogsPath).CombinedOutput(); err != nil {
+		log.Printf("[WARNING] chmod steamLogsPath failed: %v, output: %s", err, string(out))
+	}
 
 	sharedVolume := fmt.Sprintf("%s/ServerFiles/arkserver_temp:/home/pok/arkserver", hostPath)
 	logsVolume := fmt.Sprintf("%s/ServerFiles/steam_logs:/home/pok/.steam/steam/logs", hostPath)
@@ -506,31 +502,31 @@ func runUpdateOrchestration() {
 
 	manifestCopied := false
 
-	// 1. Check if the file is already on the host (written directly to the mount by SteamCMD)
-	hostManifestSrc := filepath.Join(tempPath, "steamapps", "appmanifest_2430930.acf")
-	if _, err := os.Stat(hostManifestSrc); err == nil {
-		log.Printf("[INFO] Found appmanifest already on host mount: %s", hostManifestSrc)
-		manifestCopied = true
+	// 1. Try to copy the fresh manifest from the updater container first (where SteamCMD writes the download status)
+	manifestLocations := []string{
+		"pok_updater:/home/pok/.steam/steam/steamapps/appmanifest_2430930.acf",
+		"pok_updater:/home/pok/Steam/steamapps/appmanifest_2430930.acf",
+		"pok_updater:/opt/steamcmd/steamapps/appmanifest_2430930.acf",
+		"pok_updater:/home/pok/arkserver/steamapps/appmanifest_2430930.acf",
 	}
 
-	// 2. If not on host, fallback to copying from various paths inside the container
-	if !manifestCopied {
-		manifestLocations := []string{
-			"pok_updater:/home/pok/.steam/steam/steamapps/appmanifest_2430930.acf",
-			"pok_updater:/home/pok/Steam/steamapps/appmanifest_2430930.acf",
-			"pok_updater:/opt/steamcmd/steamapps/appmanifest_2430930.acf",
-			"pok_updater:/home/pok/arkserver/steamapps/appmanifest_2430930.acf",
+	for _, loc := range manifestLocations {
+		cpCmd := exec.Command("docker", "cp", loc, filepath.Join(tempPath, "steamapps", "appmanifest_2430930.acf"))
+		if output, err := cpCmd.CombinedOutput(); err == nil {
+			log.Printf("[INFO] Successfully copied appmanifest from %s", loc)
+			manifestCopied = true
+			break
+		} else {
+			log.Printf("[DEBUG] Failed to copy appmanifest from %s: %s", loc, strings.TrimSpace(string(output)))
 		}
+	}
 
-		for _, loc := range manifestLocations {
-			cpCmd := exec.Command("docker", "cp", loc, filepath.Join(tempPath, "steamapps", "appmanifest_2430930.acf"))
-			if output, err := cpCmd.CombinedOutput(); err == nil {
-				log.Printf("[INFO] Successfully copied appmanifest from %s", loc)
-				manifestCopied = true
-				break
-			} else {
-				log.Printf("[DEBUG] Failed to copy appmanifest from %s: %s", loc, strings.TrimSpace(string(output)))
-			}
+	// 2. If copy failed, fallback to checking if it is already present on the host mount
+	if !manifestCopied {
+		hostManifestSrc := filepath.Join(tempPath, "steamapps", "appmanifest_2430930.acf")
+		if _, err := os.Stat(hostManifestSrc); err == nil {
+			log.Printf("[INFO] Found appmanifest already on host mount: %s", hostManifestSrc)
+			manifestCopied = true
 		}
 	}
 
