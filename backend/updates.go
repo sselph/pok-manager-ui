@@ -339,12 +339,17 @@ func runUpdateOrchestration(forceFreshInstall bool) {
 	}
 
 	if hasExistingFiles {
-		log.Printf("Cloning live server files to temp folder using cp -a...")
-		cmd := exec.Command("cp", "-a", livePath, tempPath)
+		log.Printf("Cloning live server files to temp folder using cp -a --reflink=always...")
+		cmd := exec.Command("cp", "-a", "--reflink=always", livePath, tempPath)
 		if output, err := cmd.CombinedOutput(); err != nil {
-			log.Printf("Warning: cp -a failed: %v, output: %s. Falling back to standard copy/mkdir.", err, string(output))
+			log.Printf("[WARNING] Reflink copy failed: %v, output: %s. Falling back to standard cp -a.", err, string(output))
 			_ = os.RemoveAll(tempPath)
-			_ = os.MkdirAll(tempPath, 0775)
+			cmdFallback := exec.Command("cp", "-a", livePath, tempPath)
+			if outFallback, errFallback := cmdFallback.CombinedOutput(); errFallback != nil {
+				log.Printf("[WARNING] Fallback cp -a failed: %v, output: %s. Falling back to empty directory.", errFallback, string(outFallback))
+				_ = os.RemoveAll(tempPath)
+				_ = os.MkdirAll(tempPath, 0775)
+			}
 		}
 	} else {
 		_ = os.MkdirAll(tempPath, 0775)
@@ -395,6 +400,7 @@ func runUpdateOrchestration(forceFreshInstall bool) {
 		"--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
 		"--entrypoint", "/bin/bash",
 		"--security-opt", "seccomp=unconfined",
+		"-e", "TEMP_DOWNLOAD_ROOT=/home/pok/arkserver/steamapps/temp",
 		"-v", sharedVolume,
 		"-v", logsVolume,
 		"acekorneya/asa_server:2_1_latest",
