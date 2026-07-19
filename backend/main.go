@@ -91,6 +91,7 @@ func main() {
 	registry.Register(&CreateCommand{})
 	registry.Register(&StatusCommand{})
 	registry.Register(&DeleteCommand{})
+	registry.Register(&OrchestrateUpdateCommand{})
 
 	// Handle run-cmd flag
 	if *runCmdFlag != "" {

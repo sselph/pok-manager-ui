@@ -138,6 +138,25 @@ func (c *UpdateCommand) Execute(ctx context.Context, env *CommandEnv, args []str
 	return RunDockerCompose(env.BaseDir, name, "restart")
 }
 
+// OrchestrateUpdateCommand runs the SteamCMD game files update process
+type OrchestrateUpdateCommand struct{}
+
+func (c *OrchestrateUpdateCommand) Name() string        { return "update-game" }
+func (c *OrchestrateUpdateCommand) Description() string { return "Trigger SteamCMD game files update check and orchestration" }
+func (c *OrchestrateUpdateCommand) Execute(ctx context.Context, env *CommandEnv, args []string, writer io.Writer) error {
+	StartUpdateManager(env.BaseDir, NewRegistry(env))
+	_, _ = fmt.Fprintln(writer, "Starting game update check and download...")
+	freshInstall := false
+	for _, arg := range args {
+		if arg == "-fresh-install" || arg == "--fresh-install" {
+			freshInstall = true
+		}
+	}
+	runUpdateOrchestration(freshInstall)
+	_, _ = fmt.Fprintln(writer, "Game update orchestration process finished.")
+	return nil
+}
+
 // CreateCommand creates an instance
 type CreateCommand struct{}
 

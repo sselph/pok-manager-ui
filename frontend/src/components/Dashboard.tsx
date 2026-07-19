@@ -164,12 +164,22 @@ function Dashboard({ onLogout }: DashboardProps) {
     }
   }
 
-  const handleTriggerUpdate = async () => {
-    if (!window.confirm("Are you sure you want to trigger a central update? This will warn players, save world data, stop running instances, update files, and restart the servers.")) {
+  const handleTriggerUpdate = async (freshInstall: boolean = false) => {
+    const confirmMsg = freshInstall
+      ? "WARNING: This will completely WIPE the current server files directory, skip the backup/copy stage, and trigger a fresh SteamCMD download from scratch. Active instances will be stopped and restarted. Are you sure you want to proceed?"
+      : "Are you sure you want to trigger a central update? This will warn players, save world data, stop running instances, update files, and restart the servers.";
+    
+    if (!window.confirm(confirmMsg)) {
       return
     }
     try {
-      await fetch('/api/updates/trigger', { method: 'POST' })
+      await fetch('/api/updates/trigger', { 
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ freshInstall })
+      })
       fetchUpdates()
     } catch (err) {
       console.error('Failed to trigger update:', err)
@@ -396,10 +406,21 @@ function Dashboard({ onLogout }: DashboardProps) {
                   <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
                 </svg>
               </button>
+              {!updates.updateRunning && (
+                <button 
+                  type="button"
+                  className="btn btn-secondary" 
+                  onClick={() => handleTriggerUpdate(true)}
+                  style={{ borderColor: 'var(--color-warning)', color: 'var(--color-warning)', minWidth: '110px' }}
+                  title="Wipe existing server files and download the entire game from scratch"
+                >
+                  Fresh Install
+                </button>
+              )}
               {updates.currentBuild !== updates.latestBuild && updates.latestBuild !== '0' && (
                 <button 
                   className="btn btn-primary" 
-                  onClick={handleTriggerUpdate} 
+                  onClick={() => handleTriggerUpdate(false)} 
                   disabled={updates.updateRunning}
                   style={{ background: 'var(--color-error)', borderColor: 'var(--color-error)' }}
                 >

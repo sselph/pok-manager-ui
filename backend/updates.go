@@ -270,7 +270,7 @@ type ActiveInstance struct {
 	Password string
 }
 
-func runUpdateOrchestration() {
+func runUpdateOrchestration(forceFreshInstall bool) {
 	updateStateMu.Lock()
 	if updateState.UpdateRunning {
 		updateStateMu.Unlock()
@@ -328,71 +328,38 @@ func runUpdateOrchestration() {
 	tempPath := filepath.Join(updateBaseDir, "ServerFiles", "arkserver_temp")
 	livePath := filepath.Join(updateBaseDir, "ServerFiles", "arkserver")
 	oldPath := filepath.Join(updateBaseDir, "ServerFiles", "arkserver_old")
-
 	_ = os.RemoveAll(tempPath)
 	_ = os.RemoveAll(oldPath)
 
-	if _, err := os.Stat(livePath); err == nil {
+	hasExistingFiles := false
+	if !forceFreshInstall {
+		if _, err := os.Stat(filepath.Join(livePath, "ShooterGame")); err == nil {
+			hasExistingFiles = true
+		}
+	}
+
+	if hasExistingFiles {
 		log.Printf("Cloning live server files to temp folder using cp -a...")
 		cmd := exec.Command("cp", "-a", livePath, tempPath)
 		if output, err := cmd.CombinedOutput(); err != nil {
 			log.Printf("Warning: cp -a failed: %v, output: %s. Falling back to standard copy/mkdir.", err, string(output))
 			_ = os.RemoveAll(tempPath)
-			_ = os.MkdirAll(tempPath, 0755)
+			_ = os.MkdirAll(tempPath, 0775)
 		}
 	} else {
-		_ = os.MkdirAll(tempPath, 0755)
+		_ = os.MkdirAll(tempPath, 0775)
 	}
 
 	// Ensure correct ownership of the temp path so the container's pok user (UID 7777) can write to it
 	log.Printf("Setting ownership of temp folder to 7777:7777...")
 	_ = exec.Command("chown", "-R", "7777:7777", tempPath).Run()
-	// Clean up stale downloads/temp folders and break hard links on the manifest to prevent lockups
-	log.Printf("[INFO] Cleaning up stale Steam downloads and breaking hard links on manifest...")
+	// Clean up stale downloads/temp folders
+	log.Printf("[INFO] Cleaning up stale Steam downloads...")
 	_ = os.RemoveAll(filepath.Join(tempPath, "steamapps", "downloading"))
 	_ = os.RemoveAll(filepath.Join(tempPath, "steamapps", "temp"))
 
 	// Make sure the steamapps directory exists in tempPath
 	_ = os.MkdirAll(filepath.Join(tempPath, "steamapps"), 0775)
-
-	// Break hard links on all executables and DLLs in the temp directory to prevent Text file busy lockups
-	log.Printf("[INFO] Unlinking executables and DLLs to prevent Text file busy locks...")
-	unlinkedCount := 0
-	walkErr := filepath.Walk(tempPath, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			log.Printf("[WARNING] Walk error on %s: %v", path, err)
-			return nil
-		}
-		if !info.IsDir() {
-			ext := strings.ToLower(filepath.Ext(path))
-			if ext == ".exe" || ext == ".dll" {
-				content, err := os.ReadFile(path)
-				if err != nil {
-					log.Printf("[WARNING] Failed to read binary %s: %v", path, err)
-					return nil
-				}
-
-				err = os.Remove(path)
-				if err != nil {
-					log.Printf("[WARNING] Failed to remove hard link %s: %v", path, err)
-					return nil
-				}
-
-				err = os.WriteFile(path, content, info.Mode())
-				if err != nil {
-					log.Printf("[WARNING] Failed to recreate binary %s: %v", path, err)
-					return nil
-				}
-				unlinkedCount++
-			}
-		}
-		return nil
-	})
-	if walkErr != nil {
-		log.Printf("[ERROR] Walk failed: %v", walkErr)
-	} else {
-		log.Printf("[INFO] Successfully unlinked %d binary/DLL files in temp directory.", unlinkedCount)
-	}
 
 	// 4. Run central download inside temporary container pointing to tempPath
 	setUpdateState("updating", "Downloading updates in background via SteamCMD (servers remain online)...", current, latest)
@@ -421,19 +388,17 @@ func runUpdateOrchestration() {
 	_ = exec.Command("docker", "rm", "-f", "pok_updater").Run()
 
 	log.Printf("[INFO] Running SteamCMD update container with mounts: sharedVolume=%s, logsVolume=%s", sharedVolume, logsVolume)
+	cmdLine := "UPDATE_SERVER=TRUE STEAMCMD_VALIDATE=TRUE /home/pok/scripts/install_server.sh"
+
 	cmdUpdate := exec.Command("docker", "run",
 		"--name", "pok_updater",
 		"--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
-		"--entrypoint", "/opt/steamcmd/steamcmd.sh",
+		"--entrypoint", "/bin/bash",
 		"--security-opt", "seccomp=unconfined",
 		"-v", sharedVolume,
 		"-v", logsVolume,
 		"acekorneya/asa_server:2_1_latest",
-		"+force_install_dir", "/home/pok/arkserver",
-		"+login", "anonymous",
-		"+@sSteamCmdForcePlatformType", "windows",
-		"+app_update", "2430930", "validate",
-		"+quit",
+		"-c", cmdLine,
 	)
 
 	stdoutPipe, err := cmdUpdate.StdoutPipe()
@@ -757,7 +722,7 @@ func StartUpdateManager(baseDir string, reg *Registry) {
 
 					if isDiff && !isRunning && isWithinUpdateWindow() {
 						log.Printf("[INFO] Auto-update triggered centrally!")
-						go runUpdateOrchestration()
+						go runUpdateOrchestration(false)
 					}
 				}
 			case <-tickerChan:
@@ -788,6 +753,14 @@ func handleCheckUpdates(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleTriggerUpdate(w http.ResponseWriter, r *http.Request) {
+	type TriggerRequest struct {
+		FreshInstall bool `json:"freshInstall"`
+	}
+	var req TriggerRequest
+	if r.Header.Get("Content-Type") == "application/json" {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+
 	updateStateMu.Lock()
 	if updateState.UpdateRunning {
 		updateStateMu.Unlock()
@@ -796,7 +769,7 @@ func handleTriggerUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	updateStateMu.Unlock()
 
-	go runUpdateOrchestration()
+	go runUpdateOrchestration(req.FreshInstall)
 
 	w.WriteHeader(http.StatusAccepted)
 	_, _ = w.Write([]byte(`{"status":"accepted","message":"Update process initiated"}`))
