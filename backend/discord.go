@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -236,6 +237,30 @@ func registerDiscordCommands(choices []*discordgo.ApplicationCommandOptionChoice
 				},
 			},
 		},
+		{
+			Name:        "status",
+			Description: "Show status, RAM usage, version, and player count for all cluster servers",
+		},
+		{
+			Name:                     "forceupdate",
+			Description:              "Trigger global ARK game update check & deployment",
+			DefaultMemberPermissions: &defaultMemberPermissions,
+			DMPermission:             &dmPermission,
+			Options: []*discordgo.ApplicationCommandOption{
+				{
+					Type:        discordgo.ApplicationCommandOptionBoolean,
+					Name:        "fresh_install",
+					Description: "Perform a clean fresh install (skips file copy)",
+					Required:    false,
+				},
+				{
+					Type:        discordgo.ApplicationCommandOptionBoolean,
+					Name:        "force_reboot",
+					Description: "Force immediate reboot of active servers even if minor update",
+					Required:    false,
+				},
+			},
+		},
 	}
 
 	log.Printf("Syncing Discord slash commands (%d server choices)...", len(choices))
@@ -283,6 +308,25 @@ func handleDiscordInteraction(s *discordgo.Session, i *discordgo.InteractionCrea
 	}
 
 	switch cmdName {
+	case "status":
+		go func() {
+			output := generateClusterStatusOutput(baseDirectory)
+			updateResponse(output)
+		}()
+
+	case "forceupdate":
+		freshInstall := false
+		forceReboot := false
+		if opt, exists := optionMap["fresh_install"]; exists {
+			freshInstall = opt.BoolValue()
+		}
+		if opt, exists := optionMap["force_reboot"]; exists {
+			forceReboot = opt.BoolValue()
+		}
+
+		updateResponse(fmt.Sprintf("🔄 **[POK Update]** Triggering game update orchestration (Fresh Install: %t, Force Immediate Reboot: %t)...", freshInstall, forceReboot))
+		go runUpdateOrchestration(freshInstall, forceReboot)
+
 	case "start", "stop", "restart", "update", "saveworld", "listplayers":
 		serverOpt, exists := optionMap["server"]
 		if !exists {
@@ -542,11 +586,27 @@ func MonitorInstanceStartup(instanceName, channelID string) {
 			if health == "healthy" || (status == "running" && health == "none") {
 				// Container is fully booted! Let's get the version from the logs.
 				version := "unknown"
-				cmd := exec.Command("docker", "logs", containerName)
-				if output, err := cmd.CombinedOutput(); err == nil {
+				// Check ShooterGame.log first for latest entry
+				logPath := filepath.Join(baseDirectory, fmt.Sprintf("Instance_%s", instanceName), "Saved", "Logs", "ShooterGame.log")
+				if content, err := os.ReadFile(logPath); err == nil {
 					reVersion := regexp.MustCompile(`ARK Version:\s*([0-9.]+)`)
-					if matches := reVersion.FindStringSubmatch(string(output)); len(matches) >= 2 {
-						version = matches[1]
+					if matches := reVersion.FindAllStringSubmatch(string(content), -1); len(matches) > 0 {
+						last := matches[len(matches)-1]
+						if len(last) >= 2 {
+							version = strings.TrimSpace(last[1])
+						}
+					}
+				}
+				if version == "unknown" {
+					cmd := exec.Command("docker", "logs", containerName)
+					if output, err := cmd.CombinedOutput(); err == nil {
+						reVersion := regexp.MustCompile(`ARK Version:\s*([0-9.]+)`)
+						if matches := reVersion.FindAllStringSubmatch(string(output), -1); len(matches) > 0 {
+							last := matches[len(matches)-1]
+							if len(last) >= 2 {
+								version = strings.TrimSpace(last[1])
+							}
+						}
 					}
 				}
 
@@ -557,4 +617,114 @@ func MonitorInstanceStartup(instanceName, channelID string) {
 			}
 		}
 	}
+}
+
+func getPlayerCount(port, pass string) string {
+	if port == "" || pass == "" {
+		return "-"
+	}
+	resp, err := runRconCommand(port, pass, "ListPlayers")
+	if err != nil || resp == "" || strings.Contains(strings.ToLower(resp), "no players") {
+		return "0"
+	}
+	lines := strings.Split(resp, "\n")
+	count := 0
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" && !strings.HasPrefix(line, "ID") {
+			count++
+		}
+	}
+	return fmt.Sprintf("%d", count)
+}
+
+func getInstanceVersion(baseDir, instName string) string {
+	logPath := filepath.Join(baseDir, fmt.Sprintf("Instance_%s", instName), "Saved", "Logs", "ShooterGame.log")
+	if content, err := os.ReadFile(logPath); err == nil {
+		reVersion := regexp.MustCompile(`ARK Version:\s*([0-9.]+)`)
+		if matches := reVersion.FindAllStringSubmatch(string(content), -1); len(matches) > 0 {
+			last := matches[len(matches)-1]
+			if len(last) >= 2 {
+				return "v" + strings.TrimSpace(last[1])
+			}
+		}
+	}
+	updateStateMu.Lock()
+	curVer := updateState.CurrentVersion
+	updateStateMu.Unlock()
+
+	if curVer != "" {
+		return "v" + curVer
+	}
+	return "-"
+}
+
+func generateClusterStatusOutput(baseDir string) string {
+	instances, err := ListInstances(baseDir)
+	if err != nil || len(instances) == 0 {
+		return "⚠️ No configured server instances found."
+	}
+
+	var sb strings.Builder
+	sb.WriteString("📊 **[ARK Cluster Status]**\n\n")
+
+	var offlineServers []string
+
+	for _, instName := range instances {
+		status, health, _ := GetContainerStatus(instName)
+		cfg, _ := LoadInstanceConfig(baseDir, instName)
+		rconPort := ""
+		adminPass := ""
+		if cfg != nil {
+			rconPort = cfg.Settings["RCON Port"]
+			adminPass = cfg.Settings["Admin Password"]
+		}
+
+		if status == "running" {
+			stateEmoji := "🟢"
+			stateText := "ONLINE"
+			if health == "starting" {
+				stateEmoji = "🟡"
+				stateText = "STARTING"
+			} else if health == "unhealthy" {
+				stateEmoji = "🔴"
+				stateText = "UNHEALTHY"
+			}
+
+			_, mem, _ := GetContainerResourceUsage(instName)
+			memStr := strings.TrimSpace(mem)
+			if memStr == "" || memStr == "0B / 0B" {
+				memStr = "N/A"
+			}
+
+			versionStr := getInstanceVersion(baseDir, instName)
+			playersStr := getPlayerCount(rconPort, adminPass)
+
+			sb.WriteString(fmt.Sprintf("%s **%s** (`%s`)\n", stateEmoji, instName, versionStr))
+			sb.WriteString(fmt.Sprintf("• Status: `%s` | Players: `%s` | RAM: `%s`\n\n", stateText, playersStr, memStr))
+		} else {
+			offlineServers = append(offlineServers, fmt.Sprintf("`%s`", instName))
+		}
+	}
+
+	if len(offlineServers) > 0 {
+		sb.WriteString(fmt.Sprintf("🔴 **Offline**: %s\n\n", strings.Join(offlineServers, ", ")))
+	}
+
+	updateStateMu.Lock()
+	curVer := updateState.CurrentVersion
+	latestVer := updateState.LatestVersion
+	upType := updateState.UpdateType
+	updateStateMu.Unlock()
+
+	if curVer != "" {
+		sb.WriteString(fmt.Sprintf("_Cluster Version: **v%s**_", curVer))
+		if upType == "minor" && latestVer != "" {
+			sb.WriteString(fmt.Sprintf(" (🟡 Minor Update **v%s** staged)", latestVer))
+		} else if upType == "major" && latestVer != "" {
+			sb.WriteString(fmt.Sprintf(" (🔴 Major Update **v%s** available)", latestVer))
+		}
+	}
+
+	return sb.String()
 }

@@ -37,6 +37,10 @@ function Dashboard({ onLogout }: DashboardProps) {
     message: string
     currentBuild: string
     latestBuild: string
+    currentVersion?: string
+    latestVersion?: string
+    updateType?: string
+    pendingRestartServers?: string[]
     lastCheck: string
     updateRunning: boolean
     progress: number
@@ -164,11 +168,14 @@ function Dashboard({ onLogout }: DashboardProps) {
     }
   }
 
-  const handleTriggerUpdate = async (freshInstall: boolean = false) => {
-    const confirmMsg = freshInstall
-      ? "WARNING: This will completely WIPE the current server files directory, skip the backup/copy stage, and trigger a fresh SteamCMD download from scratch. Active instances will be stopped and restarted. Are you sure you want to proceed?"
-      : "Are you sure you want to trigger a central update? This will warn players, save world data, stop running instances, update files, and restart the servers.";
-    
+  const handleTriggerUpdate = async (freshInstall: boolean = false, forceReboot: boolean = false) => {
+    let confirmMsg = "Are you sure you want to trigger a central update? This will check/download update files in the background.";
+    if (freshInstall) {
+      confirmMsg = "WARNING: This will completely WIPE the current server files directory, skip the backup/copy stage, and trigger a fresh SteamCMD download from scratch. Are you sure?";
+    } else if (forceReboot) {
+      confirmMsg = "Are you sure you want to FORCE REBOOT all active servers immediately? This will send RCON warnings, save world data, and restart all servers regardless of minor update status or online players.";
+    }
+
     if (!window.confirm(confirmMsg)) {
       return
     }
@@ -178,7 +185,7 @@ function Dashboard({ onLogout }: DashboardProps) {
         headers: {
           'Content-Type': 'application/json'
         },
-        body: JSON.stringify({ freshInstall })
+        body: JSON.stringify({ freshInstall, forceReboot })
       })
       fetchUpdates()
     } catch (err) {
@@ -420,11 +427,21 @@ function Dashboard({ onLogout }: DashboardProps) {
               {updates.currentBuild !== updates.latestBuild && updates.latestBuild !== '0' && (
                 <button 
                   className="btn btn-primary" 
-                  onClick={() => handleTriggerUpdate(false)} 
+                  onClick={() => handleTriggerUpdate(false, false)} 
                   disabled={updates.updateRunning}
                   style={{ background: 'var(--color-error)', borderColor: 'var(--color-error)' }}
                 >
                   Apply Update
+                </button>
+              )}
+              {updates.pendingRestartServers && updates.pendingRestartServers.length > 0 && !updates.updateRunning && (
+                <button 
+                  className="btn btn-secondary" 
+                  onClick={() => handleTriggerUpdate(false, true)}
+                  style={{ borderColor: '#f59e0b', color: '#f59e0b' }}
+                  title="Force immediate reboot of all pending servers"
+                >
+                  Force Reboot All
                 </button>
               )}
             </div>

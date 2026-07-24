@@ -147,12 +147,16 @@ func (c *OrchestrateUpdateCommand) Execute(ctx context.Context, env *CommandEnv,
 	StartUpdateManager(env.BaseDir, NewRegistry(env))
 	_, _ = fmt.Fprintln(writer, "Starting game update check and download...")
 	freshInstall := false
+	forceReboot := false
 	for _, arg := range args {
 		if arg == "-fresh-install" || arg == "--fresh-install" {
 			freshInstall = true
 		}
+		if arg == "-force-reboot" || arg == "--force-reboot" {
+			forceReboot = true
+		}
 	}
-	runUpdateOrchestration(freshInstall)
+	runUpdateOrchestration(freshInstall, forceReboot)
 	_, _ = fmt.Fprintln(writer, "Game update orchestration process finished.")
 	return nil
 }

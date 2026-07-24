@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -11,19 +12,24 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
 type UpdateState struct {
-	Status        string    `json:"status"` // "idle", "checking", "updating", "starting", "error"
-	Message       string    `json:"message"`
-	CurrentBuild  string    `json:"currentBuild"`
-	LatestBuild   string    `json:"latestBuild"`
-	LastCheck     time.Time `json:"lastCheck"`
-	UpdateRunning bool      `json:"updateRunning"`
-	Progress      int       `json:"progress"` // percentage 0-100
+	Status                string    `json:"status"` // "idle", "checking", "updating", "starting", "error"
+	Message               string    `json:"message"`
+	CurrentBuild          string    `json:"currentBuild"`
+	LatestBuild           string    `json:"latestBuild"`
+	CurrentVersion        string    `json:"currentVersion"`
+	LatestVersion         string    `json:"latestVersion"`
+	UpdateType            string    `json:"updateType"` // "none", "minor", "major"
+	PendingRestartServers []string  `json:"pendingRestartServers"`
+	LastCheck             time.Time `json:"lastCheck"`
+	UpdateRunning         bool      `json:"updateRunning"`
+	Progress              int       `json:"progress"` // percentage 0-100
 }
 
 type UpdateSettings struct {
@@ -36,19 +42,76 @@ type UpdateSettings struct {
 }
 
 var (
-	updateState      UpdateState
-	updateStateMu    sync.Mutex
-	updateBaseDir    string
-	updateRegistry   *Registry
-	updateSettings   UpdateSettings
-	updateSettingsMu sync.RWMutex
-	tickerChan       chan bool
+	updateState             UpdateState
+	updateStateMu           sync.Mutex
+	updateBaseDir           string
+	updateRegistry          *Registry
+	updateSettings          UpdateSettings
+	updateSettingsMu        sync.RWMutex
+	tickerChan              chan bool
+	pendingRestarts         = make(map[string]bool)
+	pendingRestartsMu       sync.Mutex
+	cachedCurrentArkVersion string
+	deferredWorkerStarted   bool
+	deferredWorkerMu        sync.Mutex
 )
+
+type ArkVersion struct {
+	Major int
+	Minor int
+	Raw   string
+}
+
+func parseArkVersion(raw string) ArkVersion {
+	v := ArkVersion{Raw: raw}
+	rawClean := strings.TrimSpace(raw)
+	rawClean = strings.TrimPrefix(rawClean, "v")
+	parts := strings.Split(rawClean, ".")
+	if len(parts) >= 1 {
+		v.Major, _ = strconv.Atoi(parts[0])
+	}
+	if len(parts) >= 2 {
+		v.Minor, _ = strconv.Atoi(parts[1])
+	}
+	return v
+}
+
+// CompareArkVersions returns:
+// "major" if newVer.Major > currentVer.Major
+// "minor" if newVer.Major == currentVer.Major && newVer.Minor > currentVer.Minor
+// "none" otherwise
+func CompareArkVersions(currentRaw, newRaw string) string {
+	if currentRaw == "" || newRaw == "" {
+		return "minor" // fallback to minor if one version is unknown
+	}
+	cur := parseArkVersion(currentRaw)
+	next := parseArkVersion(newRaw)
+
+	if next.Major > cur.Major {
+		return "major"
+	}
+	if next.Major == cur.Major && next.Minor > cur.Minor {
+		return "minor"
+	}
+	return "none"
+}
+
+func SetCachedCurrentArkVersion(version string) {
+	if version == "" {
+		return
+	}
+	updateStateMu.Lock()
+	cachedCurrentArkVersion = version
+	updateState.CurrentVersion = version
+	updateStateMu.Unlock()
+}
 
 func init() {
 	updateState = UpdateState{
-		Status:  "idle",
-		Message: "System idle",
+		Status:                "idle",
+		Message:               "System idle",
+		UpdateType:            "none",
+		PendingRestartServers: []string{},
 	}
 	updateSettings = UpdateSettings{
 		AutoUpdateEnabled:  false,
@@ -270,7 +333,131 @@ type ActiveInstance struct {
 	Password string
 }
 
-func runUpdateOrchestration(forceFreshInstall bool) {
+func probeGameVersion(tempPath string) (string, error) {
+	log.Printf("[INFO] Probing ARK game version from temp directory...")
+	hostPath := os.Getenv("HOST_BASE_DIR")
+	if hostPath == "" {
+		hostPath = updateBaseDir
+	}
+	hostTempPath := fmt.Sprintf("%s/ServerFiles/arkserver_temp", hostPath)
+
+	_ = exec.Command("docker", "rm", "-f", "pok_version_probe").Run()
+	cmd := exec.Command("docker", "run", "--rm",
+		"--name", "pok_version_probe",
+		"--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
+		"--entrypoint", "/bin/bash",
+		"-e", "MAP_NAME=InvalidMapName",
+		"-v", fmt.Sprintf("%s:/home/pok/arkserver", hostTempPath),
+		"acekorneya/asa_server:2_1_latest",
+		"-c", "timeout 25 /home/pok/scripts/launch_ASA.sh",
+	)
+
+	outBuf := &bytes.Buffer{}
+	cmd.Stdout = outBuf
+	cmd.Stderr = outBuf
+
+	_ = cmd.Run()
+
+	output := outBuf.String()
+	reVersion := regexp.MustCompile(`ARK Version:\s*([0-9.]+)`)
+	if matches := reVersion.FindAllStringSubmatch(output, -1); len(matches) > 0 {
+		last := matches[len(matches)-1]
+		if len(last) >= 2 {
+			ver := strings.TrimSpace(last[1])
+			log.Printf("[INFO] Successfully probed ARK Version: %s", ver)
+			return ver, nil
+		}
+	}
+
+	return "", fmt.Errorf("version string not found in probe output")
+}
+
+func startDeferredRestartWorker() {
+	deferredWorkerMu.Lock()
+	if deferredWorkerStarted {
+		deferredWorkerMu.Unlock()
+		return
+	}
+	deferredWorkerStarted = true
+	deferredWorkerMu.Unlock()
+
+	go func() {
+		ticker := time.NewTicker(20 * time.Second)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			pendingRestartsMu.Lock()
+			if len(pendingRestarts) == 0 {
+				pendingRestartsMu.Unlock()
+				deferredWorkerMu.Lock()
+				deferredWorkerStarted = false
+				deferredWorkerMu.Unlock()
+				return
+			}
+
+			var toCheck []string
+			for name := range pendingRestarts {
+				toCheck = append(toCheck, name)
+			}
+			pendingRestartsMu.Unlock()
+
+			for _, instName := range toCheck {
+				cfg, err := LoadInstanceConfig(updateBaseDir, instName)
+				if err != nil {
+					continue
+				}
+				port := cfg.Settings["RCON Port"]
+				pass := cfg.Settings["Admin Password"]
+
+				status, _, _ := GetContainerStatus(instName)
+				if status != "running" || (port != "" && pass != "" && !hasPlayersOnline(port, pass)) {
+					log.Printf("[INFO] Deferred restart: server %s is empty/stopped. Rebooting instance to load updated minor version...", instName)
+					if status == "running" && port != "" && pass != "" {
+						_, _ = runRconCommand(port, pass, "SaveWorld")
+					}
+
+					_ = RunDockerCompose(updateBaseDir, instName, "restart")
+
+					pendingRestartsMu.Lock()
+					delete(pendingRestarts, instName)
+					var remaining []string
+					for k := range pendingRestarts {
+						remaining = append(remaining, k)
+					}
+					pendingRestartsMu.Unlock()
+
+					updateStateMu.Lock()
+					updateState.PendingRestartServers = remaining
+					latestVer := updateState.LatestVersion
+					if latestVer != "" {
+						updateState.CurrentVersion = latestVer
+						cachedCurrentArkVersion = latestVer
+					}
+					if len(remaining) == 0 {
+						updateState.UpdateType = "none"
+					}
+					updateStateMu.Unlock()
+
+					verStr := ""
+					if latestVer != "" {
+						verStr = fmt.Sprintf(" **v%s**", latestVer)
+					}
+
+					channelID := cfg.Settings["Discord Channel ID"]
+					if channelID != "" {
+						SendDiscordMessage(channelID, fmt.Sprintf("🟢 **[Server Update]** Server `%s` restarted to load Minor Update%s (0 players online).", instName, verStr))
+					}
+
+					if len(remaining) == 0 {
+						SendGlobalDiscordMessage(fmt.Sprintf("🎉 **[POK Update]** All servers have successfully updated to Minor Version%s!", verStr))
+					}
+				}
+			}
+		}
+	}()
+}
+
+func runUpdateOrchestration(forceFreshInstall bool, forceImmediateReboot bool) {
 	updateStateMu.Lock()
 	if updateState.UpdateRunning {
 		updateStateMu.Unlock()
@@ -322,7 +509,7 @@ func runUpdateOrchestration(forceFreshInstall bool) {
 		}
 	}
 
-	// 3. Prepare temp directory using cp -al to create instant space-efficient hardlinks
+	// 3. Prepare temp directory using cp -a --reflink=always for instant copy-on-write
 	setUpdateState("updating", "Preparing temporary update directory...", current, latest)
 
 	tempPath := filepath.Join(updateBaseDir, "ServerFiles", "arkserver_temp")
@@ -358,8 +545,8 @@ func runUpdateOrchestration(forceFreshInstall bool) {
 	// Ensure correct ownership of the temp path so the container's pok user (UID 7777) can write to it
 	log.Printf("Setting ownership of temp folder to 7777:7777...")
 	_ = exec.Command("chown", "-R", "7777:7777", tempPath).Run()
-	// Clean up stale downloads/temp folders
-	log.Printf("[INFO] Cleaning up stale Steam downloads...")
+	// Clean up stale Steam downloads and temporary files in the staged update directory
+	log.Printf("[INFO] Cleaning up stale Steam downloads and temporary files...")
 	_ = os.RemoveAll(filepath.Join(tempPath, "steamapps", "downloading"))
 	_ = os.RemoveAll(filepath.Join(tempPath, "steamapps", "temp"))
 
@@ -423,34 +610,24 @@ func runUpdateOrchestration(forceFreshInstall bool) {
 		return
 	}
 
-	// Read output line-by-line, splitting on both newlines (\n) and carriage returns (\r)
-	// to capture real-time progress ticks from SteamCMD.
-	scanner := bufio.NewScanner(stdoutPipe)
-	scanner.Split(ScanLinesOrCR)
-	reProgress := regexp.MustCompile(`Update state[\s:]*(?:\([^)]*\))?[\s:]*(\w+).*?progress:\s*([0-9.]+)`)
-
+	// Scanner loop for terminal progress
 	go func() {
+		scanner := bufio.NewScanner(stdoutPipe)
+		scanner.Split(ScanLinesOrCR)
+		reProgress := regexp.MustCompile(`progress:\s+([0-9.]+)\s+\((\d+)\s+/\s+(\d+)\)`)
+
 		for scanner.Scan() {
 			line := scanner.Text()
 			log.Printf("[SteamCMD] %s", line)
 
 			matches := reProgress.FindStringSubmatch(line)
-			if len(matches) >= 3 {
-				stateName := matches[1]   // "downloading" or "verifying"
-				progressStr := matches[2] // "50.81"
-
-				var progressFloat float64
-				_, err := fmt.Sscanf(progressStr, "%f", &progressFloat)
+			if len(matches) >= 2 {
+				progressFloat, err := strconv.ParseFloat(matches[1], 64)
 				if err == nil {
 					percent := int(progressFloat)
-					stateLabel := "Downloading"
-					if strings.ToLower(stateName) == "verifying" {
-						stateLabel = "Verifying"
-					}
-
 					updateStateMu.Lock()
 					updateState.Progress = percent
-					updateState.Message = fmt.Sprintf("%s updates: %d%% completed...", stateLabel, percent)
+					updateState.Message = fmt.Sprintf("Downloading updates: %d%% completed...", percent)
 					updateStateMu.Unlock()
 				}
 			}
@@ -465,54 +642,8 @@ func runUpdateOrchestration(forceFreshInstall bool) {
 		return
 	}
 
-	SendGlobalDiscordMessage(fmt.Sprintf("💾 **[POK Update]** Update build `%s` downloaded successfully. Commencing deployment orchestration...", latest))
-
-	// Copy appmanifest from the stopped container to our persistent temp folder
-	log.Printf("[INFO] Copying appmanifest from stopped container...")
-	_ = os.MkdirAll(filepath.Join(tempPath, "steamapps"), 0755)
-
-	manifestCopied := false
-
-	// 1. Try to copy the fresh manifest from the updater container first (where SteamCMD writes the download status)
-	manifestLocations := []string{
-		"pok_updater:/home/pok/.steam/steam/steamapps/appmanifest_2430930.acf",
-		"pok_updater:/home/pok/Steam/steamapps/appmanifest_2430930.acf",
-		"pok_updater:/opt/steamcmd/steamapps/appmanifest_2430930.acf",
-		"pok_updater:/home/pok/arkserver/steamapps/appmanifest_2430930.acf",
-	}
-
-	for _, loc := range manifestLocations {
-		cpCmd := exec.Command("docker", "cp", loc, filepath.Join(tempPath, "steamapps", "appmanifest_2430930.acf"))
-		if output, err := cpCmd.CombinedOutput(); err == nil {
-			log.Printf("[INFO] Successfully copied appmanifest from %s", loc)
-			manifestCopied = true
-			break
-		} else {
-			log.Printf("[DEBUG] Failed to copy appmanifest from %s: %s", loc, strings.TrimSpace(string(output)))
-		}
-	}
-
-	// 2. If copy failed, fallback to checking if it is already present on the host mount
-	if !manifestCopied {
-		hostManifestSrc := filepath.Join(tempPath, "steamapps", "appmanifest_2430930.acf")
-		if _, err := os.Stat(hostManifestSrc); err == nil {
-			log.Printf("[INFO] Found appmanifest already on host mount: %s", hostManifestSrc)
-			manifestCopied = true
-		}
-	}
-
-	if !manifestCopied {
-		log.Printf("Warning: Could not find appmanifest_2430930.acf in any host or container paths.")
-	} else {
-		// Copy it to the parent directory too, since the container startup scripts expect it there
-		// to verify that the server files are already installed (and skip the initial install check).
-		srcManifest := filepath.Join(tempPath, "steamapps", "appmanifest_2430930.acf")
-		dstManifest := filepath.Join(tempPath, "appmanifest_2430930.acf")
-		if input, err := os.ReadFile(srcManifest); err == nil {
-			_ = os.WriteFile(dstManifest, input, 0644)
-			log.Printf("[INFO] Copied appmanifest to parent directory: %s", dstManifest)
-		}
-	}
+	_ = exec.Command("docker", "rm", "-f", "pok_updater").Run()
+	SendGlobalDiscordMessage(fmt.Sprintf("💾 **[POK Update]** Update build `%s` downloaded successfully.", latest))
 
 	// Clean up conflicting Steam DLL files natively on the host
 	log.Printf("[INFO] Cleaning up conflicting Steam DLL files...")
@@ -529,129 +660,34 @@ func runUpdateOrchestration(forceFreshInstall bool) {
 		_ = os.Remove(path)
 	}
 
-	// Remove the temporary container
-	_ = exec.Command("docker", "rm", "-f", "pok_updater").Run()
+	// 5. Version Probing & Classification
+	probedVersion, probeErr := probeGameVersion(tempPath)
+	currentVer := cachedCurrentArkVersion
+	if currentVer == "" {
+		updateStateMu.Lock()
+		currentVer = updateState.CurrentVersion
+		updateStateMu.Unlock()
+	}
 
-	// 5. Now that download is complete, warn players and save world on all active instances
-	if len(activeInstances) > 0 {
-		playersOnline := false
-		for _, inst := range activeInstances {
-			if inst.RconPort != "" && inst.Password != "" {
-				if hasPlayersOnline(inst.RconPort, inst.Password) {
-					playersOnline = true
-					break
-				}
-			}
-		}
-
-		if playersOnline {
-			updateSettingsMu.RLock()
-			gracePeriod := updateSettings.GracePeriod
-			updateSettingsMu.RUnlock()
-
-			setUpdateState("updating", fmt.Sprintf("Updates downloaded. Players online: commencing %d-minute update warning countdown...", gracePeriod), current, latest)
-
-			// Notify each server's specific channel of the countdown
-			for _, inst := range activeInstances {
-				cfg, err := LoadInstanceConfig(updateBaseDir, inst.Name)
-				if err == nil {
-					channelID := cfg.Settings["Discord Channel ID"]
-					if channelID != "" {
-						SendDiscordMessage(channelID, fmt.Sprintf("⚠️ **[Server Update]** A game update is ready. The server will save and restart in %d minute(s).", gracePeriod))
-					}
-				}
-			}
-
-			earlyLogout := false
-			for remaining := gracePeriod; remaining > 0; remaining-- {
-				msg := fmt.Sprintf("Server shutting down for update in %d minute(s). Please prepare to log out safely.", remaining)
-				if remaining == 1 {
-					msg = "Server shutting down for update in 1 minute. Save and shutdown starting soon!"
-				}
-				for _, inst := range activeInstances {
-					if inst.RconPort != "" && inst.Password != "" {
-						_, _ = runRconCommand(inst.RconPort, inst.Password, fmt.Sprintf("ServerChat %q", msg))
-					}
-				}
-
-				// Sleep for 60 seconds in 10-second steps to check if players logged out early
-				for step := 0; step < 6; step++ {
-					time.Sleep(10 * time.Second)
-					if !anyPlayersOnline(activeInstances) {
-						earlyLogout = true
-						break
-					}
-				}
-				if earlyLogout {
-					break
-				}
-			}
-
-			if earlyLogout {
-				log.Printf("[INFO] All players logged out early. Terminating countdown.")
-				SendGlobalDiscordMessage("💾 **[POK Update]** All players logged out early. Skipping remaining countdown to apply update immediately...")
-			} else {
-				// Final 30s
-				for _, inst := range activeInstances {
-					if inst.RconPort != "" && inst.Password != "" {
-						_, _ = runRconCommand(inst.RconPort, inst.Password, "ServerChat \"Server shutting down for update in 30 seconds!\"")
-					}
-				}
-
-				// Check during the 20s sleep
-				for step := 0; step < 4; step++ {
-					time.Sleep(5 * time.Second)
-					if !anyPlayersOnline(activeInstances) {
-						earlyLogout = true
-						break
-					}
-				}
-
-				if !earlyLogout {
-					// Final 10s
-					for i := 10; i > 0; i-- {
-						msg := fmt.Sprintf("Server shutting down in %d...", i)
-						for _, inst := range activeInstances {
-							if inst.RconPort != "" && inst.Password != "" {
-								_, _ = runRconCommand(inst.RconPort, inst.Password, fmt.Sprintf("ServerChat %q", msg))
-							}
-						}
-						time.Sleep(1 * time.Second)
-					}
-				} else {
-					log.Printf("[INFO] All players logged out early during final seconds. Terminating countdown.")
-					SendGlobalDiscordMessage("💾 **[POK Update]** All players logged out early. Skipping remaining countdown to apply update immediately...")
-				}
-			}
-		} else {
-			setUpdateState("updating", "Updates downloaded. No players online: saving and shutting down...", current, latest)
-		}
-
-		// Save world
-		setUpdateState("updating", "Saving world data on active servers...", current, latest)
-		for _, inst := range activeInstances {
-			if inst.RconPort != "" && inst.Password != "" {
-				_, _ = runRconCommand(inst.RconPort, inst.Password, "SaveWorld")
-			}
-			cfg, err := LoadInstanceConfig(updateBaseDir, inst.Name)
-			if err == nil {
-				channelID := cfg.Settings["Discord Channel ID"]
-				if channelID != "" {
-					SendDiscordMessage(channelID, "💾 **[Server Update]** Saving World and Restarting...")
-				}
-			}
-		}
-
-		time.Sleep(10 * time.Second)
-
-		// Stop containers
-		for _, inst := range activeInstances {
-			setUpdateState("updating", fmt.Sprintf("Stopping server container: %s...", inst.Name), current, latest)
-			_ = RunDockerCompose(updateBaseDir, inst.Name, "stop")
+	updateType := "minor"
+	if probeErr == nil && probedVersion != "" {
+		updateStateMu.Lock()
+		updateState.LatestVersion = probedVersion
+		updateStateMu.Unlock()
+		if currentVer != "" {
+			updateType = CompareArkVersions(currentVer, probedVersion)
 		}
 	}
 
-	// 6. Swap directories atomically (takes milliseconds)
+	if forceImmediateReboot {
+		updateType = "major"
+	}
+
+	updateStateMu.Lock()
+	updateState.UpdateType = updateType
+	updateStateMu.Unlock()
+
+	// 6. Perform directory swap atomically (takes milliseconds)
 	setUpdateState("updating", "Applying update files (swapping directories)...", current, latest)
 
 	if _, err := os.Stat(livePath); err == nil {
@@ -668,13 +704,6 @@ func runUpdateOrchestration(forceFreshInstall bool) {
 		return
 	}
 
-	// 7. Restart previously active containers
-	for _, inst := range activeInstances {
-		setUpdateState("updating", fmt.Sprintf("Restarting server container: %s...", inst.Name), current, latest)
-		_ = RunDockerCompose(updateBaseDir, inst.Name, "start")
-
-	}
-
 	// 8. Clean up old files in separate goroutine
 	go func() {
 		log.Printf("Background cleaning up old server files directory...")
@@ -682,11 +711,160 @@ func runUpdateOrchestration(forceFreshInstall bool) {
 		log.Printf("Background cleanup complete.")
 	}()
 
-	// 9. Refresh local build info
 	newBuild, _ := getLocalBuildID()
-	setUpdateState("idle", fmt.Sprintf("Update completed successfully! New build ID: %s", newBuild), newBuild, latest)
 
-	SendGlobalDiscordMessage(fmt.Sprintf("🎉 **[POK Update]** Update completed successfully! Active servers restarted on build `%s`.", newBuild))
+	// 7. Execute update branch (Major vs Minor)
+	if updateType == "major" {
+		SendGlobalDiscordMessage(fmt.Sprintf("🚨 **[POK Major Update]** ARK Version **v%s** (Build `%s`) is a **MAJOR UPDATE**! Initiating server reboot sequence...", updateState.LatestVersion, newBuild))
+
+		if len(activeInstances) > 0 {
+			updateSettingsMu.RLock()
+			gracePeriod := updateSettings.GracePeriod
+			updateSettingsMu.RUnlock()
+
+			setUpdateState("updating", fmt.Sprintf("Major update: commencing %d-minute countdown...", gracePeriod), current, latest)
+
+			for _, inst := range activeInstances {
+				cfg, err := LoadInstanceConfig(updateBaseDir, inst.Name)
+				if err == nil {
+					channelID := cfg.Settings["Discord Channel ID"]
+					if channelID != "" {
+						SendDiscordMessage(channelID, fmt.Sprintf("⚠️ **[Major Server Update]** A major game update (**v%s**) is ready. Server will save and restart in %d minute(s).", updateState.LatestVersion, gracePeriod))
+					}
+				}
+			}
+
+			earlyLogout := false
+			for remaining := gracePeriod; remaining > 0; remaining-- {
+				msg := fmt.Sprintf("Server shutting down for MAJOR update (v%s) in %d minute(s).", updateState.LatestVersion, remaining)
+				for _, inst := range activeInstances {
+					if inst.RconPort != "" && inst.Password != "" {
+						_, _ = runRconCommand(inst.RconPort, inst.Password, fmt.Sprintf("ServerChat %q", msg))
+					}
+				}
+
+				for step := 0; step < 6; step++ {
+					time.Sleep(10 * time.Second)
+					if !anyPlayersOnline(activeInstances) {
+						earlyLogout = true
+						break
+					}
+				}
+				if earlyLogout {
+					break
+				}
+			}
+
+			if earlyLogout {
+				SendGlobalDiscordMessage("💾 **[POK Update]** All players logged out early. Rebooting active servers immediately...")
+			}
+
+			// Save world
+			for _, inst := range activeInstances {
+				if inst.RconPort != "" && inst.Password != "" {
+					_, _ = runRconCommand(inst.RconPort, inst.Password, "SaveWorld")
+				}
+			}
+
+			time.Sleep(5 * time.Second)
+
+			// Restart active instances
+			for _, inst := range activeInstances {
+				setUpdateState("updating", fmt.Sprintf("Restarting server container: %s...", inst.Name), current, latest)
+				_ = RunDockerCompose(updateBaseDir, inst.Name, "restart")
+			}
+		}
+
+		if probedVersion != "" {
+			SetCachedCurrentArkVersion(probedVersion)
+		}
+		setUpdateState("idle", fmt.Sprintf("Major Update (v%s, Build %s) completed successfully!", updateState.LatestVersion, newBuild), newBuild, latest)
+		SendGlobalDiscordMessage(fmt.Sprintf("🎉 **[POK Update]** Major update **v%s** deployed successfully!", updateState.LatestVersion))
+
+	} else {
+		// Minor Update Path
+		verLabel := ""
+		if updateState.LatestVersion != "" {
+			verLabel = " **v" + updateState.LatestVersion + "**"
+		}
+
+		log.Printf("[INFO] Minor Update%s staged. Servers remain online and will reboot when empty.", verLabel)
+		SendGlobalDiscordMessage(fmt.Sprintf("📢 **[POK Update]** Minor Update%s (Build `%s`) staged! Servers remain online and will restart individually when empty (0 players).", verLabel, newBuild))
+
+		pendingRestartsMu.Lock()
+		var pendingNames []string
+		for _, inst := range activeInstances {
+			pendingRestarts[inst.Name] = true
+			pendingNames = append(pendingNames, inst.Name)
+		}
+		pendingRestartsMu.Unlock()
+
+		updateStateMu.Lock()
+		updateState.PendingRestartServers = pendingNames
+		if len(pendingNames) == 0 {
+			updateState.UpdateType = "none"
+		}
+		updateStateMu.Unlock()
+
+		if len(pendingNames) > 0 {
+			startDeferredRestartWorker()
+		}
+
+		if probedVersion != "" {
+			SetCachedCurrentArkVersion(probedVersion)
+		}
+		setUpdateState("idle", fmt.Sprintf("Minor Update%s staged. Pending restarts: %v", verLabel, pendingNames), newBuild, latest)
+	}
+}
+
+func initCurrentVersion(baseDir string) {
+	instanceNames, err := ListInstances(baseDir)
+	if err != nil {
+		return
+	}
+	reVersion := regexp.MustCompile(`ARK Version:\s*([0-9.]+)`)
+
+	for _, instName := range instanceNames {
+		status, _, _ := GetContainerStatus(instName)
+		if status == "running" {
+			// 1. Try reading directly from Instance_<name>/Saved/Logs/ShooterGame.log on disk
+			logPath := filepath.Join(baseDir, fmt.Sprintf("Instance_%s", instName), "Saved", "Logs", "ShooterGame.log")
+			if content, err := os.ReadFile(logPath); err == nil {
+				if matches := reVersion.FindAllStringSubmatch(string(content), -1); len(matches) > 0 {
+					last := matches[len(matches)-1]
+					if len(last) >= 2 {
+						ver := strings.TrimSpace(last[1])
+						log.Printf("[INFO] Initialized current ARK Version from ShooterGame.log for instance %s: v%s", instName, ver)
+						SetCachedCurrentArkVersion(ver)
+						return
+					}
+				}
+			}
+
+			// 2. Fallback to docker logs stdout
+			containerName := fmt.Sprintf("asa_%s", instName)
+			cmd := exec.Command("docker", "logs", "--tail", "2000", containerName)
+			if output, err := cmd.CombinedOutput(); err == nil {
+				if matches := reVersion.FindAllStringSubmatch(string(output), -1); len(matches) > 0 {
+					last := matches[len(matches)-1]
+					if len(last) >= 2 {
+						ver := strings.TrimSpace(last[1])
+						log.Printf("[INFO] Initialized current ARK Version from docker logs for instance %s: v%s", instName, ver)
+						SetCachedCurrentArkVersion(ver)
+						return
+					}
+				}
+			}
+		}
+	}
+
+	livePath := filepath.Join(baseDir, "ServerFiles", "arkserver")
+	if _, err := os.Stat(filepath.Join(livePath, "ShooterGame")); err == nil {
+		if ver, err := probeGameVersion(livePath); err == nil && ver != "" {
+			log.Printf("[INFO] Initialized current ARK Version from live directory probe: v%s", ver)
+			SetCachedCurrentArkVersion(ver)
+		}
+	}
 }
 
 func StartUpdateManager(baseDir string, reg *Registry) {
@@ -697,7 +875,8 @@ func StartUpdateManager(baseDir string, reg *Registry) {
 
 	// Run initial check on boot
 	go func() {
-		time.Sleep(5 * time.Second)
+		time.Sleep(2 * time.Second)
+		initCurrentVersion(baseDir)
 		_ = checkUpdatesNow()
 	}()
 
@@ -728,7 +907,7 @@ func StartUpdateManager(baseDir string, reg *Registry) {
 
 					if isDiff && !isRunning && isWithinUpdateWindow() {
 						log.Printf("[INFO] Auto-update triggered centrally!")
-						go runUpdateOrchestration(false)
+						go runUpdateOrchestration(false, false)
 					}
 				}
 			case <-tickerChan:
@@ -761,6 +940,7 @@ func handleCheckUpdates(w http.ResponseWriter, r *http.Request) {
 func handleTriggerUpdate(w http.ResponseWriter, r *http.Request) {
 	type TriggerRequest struct {
 		FreshInstall bool `json:"freshInstall"`
+		ForceReboot  bool `json:"forceReboot"`
 	}
 	var req TriggerRequest
 	if r.Header.Get("Content-Type") == "application/json" {
@@ -775,7 +955,7 @@ func handleTriggerUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	updateStateMu.Unlock()
 
-	go runUpdateOrchestration(req.FreshInstall)
+	go runUpdateOrchestration(req.FreshInstall, req.ForceReboot)
 
 	w.WriteHeader(http.StatusAccepted)
 	_, _ = w.Write([]byte(`{"status":"accepted","message":"Update process initiated"}`))
