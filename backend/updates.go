@@ -333,13 +333,21 @@ type ActiveInstance struct {
 	Password string
 }
 
-func probeGameVersion(tempPath string) (string, error) {
-	log.Printf("[INFO] Probing ARK game version from temp directory...")
+func probeGameVersion(targetPath string) (string, error) {
+	log.Printf("[INFO] Probing ARK game version from target directory: %s", targetPath)
 	hostPath := os.Getenv("HOST_BASE_DIR")
 	if hostPath == "" {
 		hostPath = updateBaseDir
 	}
-	hostTempPath := fmt.Sprintf("%s/ServerFiles/arkserver_temp", hostPath)
+
+	relPath, err := filepath.Rel(updateBaseDir, targetPath)
+	if err != nil {
+		relPath = "ServerFiles/arkserver_temp"
+	}
+	hostTargetMount := fmt.Sprintf("%s/%s", hostPath, relPath)
+
+	logPathOnHost := filepath.Join(targetPath, "ShooterGame", "Saved", "Logs", "ShooterGame.log")
+	_ = os.Remove(logPathOnHost) // Clear old probe log if any
 
 	_ = exec.Command("docker", "rm", "-f", "pok_version_probe").Run()
 	cmd := exec.Command("docker", "run", "--rm",
@@ -347,7 +355,7 @@ func probeGameVersion(tempPath string) (string, error) {
 		"--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
 		"--entrypoint", "/bin/bash",
 		"-e", "MAP_NAME=InvalidMapName",
-		"-v", fmt.Sprintf("%s:/home/pok/arkserver", hostTempPath),
+		"-v", fmt.Sprintf("%s:/home/pok/arkserver", hostTargetMount),
 		"acekorneya/asa_server:2_1_latest",
 		"-c", "timeout 25 /home/pok/scripts/launch_ASA.sh",
 	)
@@ -358,18 +366,32 @@ func probeGameVersion(tempPath string) (string, error) {
 
 	_ = cmd.Run()
 
-	output := outBuf.String()
 	reVersion := regexp.MustCompile(`ARK Version:\s*([0-9.]+)`)
+
+	// 1. Primary: Read ShooterGame.log written on disk by ArkAscendedServer.exe
+	if content, err := os.ReadFile(logPathOnHost); err == nil {
+		if matches := reVersion.FindAllStringSubmatch(string(content), -1); len(matches) > 0 {
+			last := matches[len(matches)-1]
+			if len(last) >= 2 {
+				ver := strings.TrimSpace(last[1])
+				log.Printf("[INFO] Successfully probed ARK Version from disk log: %s", ver)
+				return ver, nil
+			}
+		}
+	}
+
+	// 2. Secondary: Fallback to container stdout/stderr
+	output := outBuf.String()
 	if matches := reVersion.FindAllStringSubmatch(output, -1); len(matches) > 0 {
 		last := matches[len(matches)-1]
 		if len(last) >= 2 {
 			ver := strings.TrimSpace(last[1])
-			log.Printf("[INFO] Successfully probed ARK Version: %s", ver)
+			log.Printf("[INFO] Successfully probed ARK Version from container stdout: %s", ver)
 			return ver, nil
 		}
 	}
 
-	return "", fmt.Errorf("version string not found in probe output")
+	return "", fmt.Errorf("version string not found in probe log file or stdout")
 }
 
 func startDeferredRestartWorker() {
@@ -449,6 +471,13 @@ func startDeferredRestartWorker() {
 					}
 
 					if len(remaining) == 0 {
+						initCurrentVersion(updateBaseDir)
+						updateStateMu.Lock()
+						curVer := updateState.CurrentVersion
+						updateStateMu.Unlock()
+						if curVer != "" {
+							verStr = fmt.Sprintf(" **v%s**", curVer)
+						}
 						SendGlobalDiscordMessage(fmt.Sprintf("🎉 **[POK Update]** All servers have successfully updated to Minor Version%s!", verStr))
 					}
 				}
